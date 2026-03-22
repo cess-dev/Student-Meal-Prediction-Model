@@ -144,13 +144,15 @@ def apply_diversity(ranked_items: list[dict], already_predicted: set,
 # ============================================================================
 def predict_meal_options(model, encoders, feature_cols, student_id, day,
                           meal_type, week=1, threshold=0.15,
-                          csv_path=None, already_predicted=None) -> pd.DataFrame:
+                          csv_path=None, already_predicted=None,
+                          available_items=None) -> pd.DataFrame:
     """
     Predict and rank all items for a meal sitting.
+    available_items: list from daily menu. Falls back to full config menu if None.
     already_predicted: set of item names chosen earlier this week (diversity).
     """
     ctx   = load_student_context(csv_path, student_id, week)
-    items = config.MENU_ITEMS[meal_type]
+    items = available_items if available_items else config.MENU_ITEMS[meal_type]
     rows  = []
     for item in items:
         feat = get_feature_context(ctx, day, meal_type, item)
