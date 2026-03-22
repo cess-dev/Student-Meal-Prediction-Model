@@ -33,6 +33,49 @@ from predict import (
     load_student_context,
     get_feature_context,
 )
+from functools import lru_cache
+import time
+
+# ============================================================================
+# SIMPLE IN-MEMORY CACHE
+# ============================================================================
+_student_id_cache: dict = {}       # school_id → internal int
+_context_cache: dict    = {}       # (student_id, week) → (df, cached_at)
+CONTEXT_CACHE_TTL = 3600           # 1 hour in seconds
+
+
+def get_cached_student_id(school_id: str) -> int:
+    """
+    Cache school_id → internal int mappings in memory.
+    Once a student is registered their ID never changes
+    so we never need to invalidate this cache.
+    """
+    if school_id not in _student_id_cache:
+        from database import get_or_create_student
+        _student_id_cache[school_id] = get_or_create_student(school_id)
+    return _student_id_cache[school_id]
+
+
+def get_cached_context(student_id: int, week: int):
+    """
+    Cache student feature context for 1 hour.
+    Context only changes when new orders are logged,
+    which happens at most a few times per day.
+    """
+    key = (student_id, week)
+    now = time.time()
+
+    if key in _context_cache:
+        df, cached_at = _context_cache[key]
+        if now - cached_at < CONTEXT_CACHE_TTL:
+            return df                          # return cached version
+        else:
+            del _context_cache[key]            # expired, remove it
+
+    # Not cached or expired — load from database
+    df = load_student_context(None, student_id, week)
+    _context_cache[key] = (df, now)
+    return df
 
 logger  = config.get_logger(__name__)
 limiter = Limiter(key_func=get_remote_address)
@@ -46,6 +89,14 @@ _state: dict = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Create database tables on startup (safe to run multiple times)
+    try:
+        from database import create_tables
+        create_tables()
+        logger.info("Database tables verified ✓")
+    except Exception as e:
+        logger.warning(f"Database setup skipped: {e}")
+
     try:
         model, encoders, feature_cols, threshold, meta = artefact_manager.load()
         _state.update(model=model, encoders=encoders,
@@ -67,7 +118,7 @@ app = FastAPI(
         "Predicts which cafeteria meals a student is likely to order "
         "based on their historical ordering patterns.\n\n"
         "**Authentication:** All prediction endpoints require an `X-API-Key` header.\n\n"
-        "**Example:** `curl -H 'X-API-Key: your-key' /predict/week?student_id=1&week=2`"
+        "**Example:** `curl -H 'X-API-Key: your-key' /predict/week?school_id=s13/34556/25&week=2`"
     ),
     version="2.0.0",
     lifespan=lifespan,
@@ -103,11 +154,11 @@ def get_model():
 # ============================================================================
 class SinglePredictionRequest(BaseModel):
     """Request body for a single item prediction."""
-    student_id: int = Field(..., gt=0, description="Student ID (positive integer)")
-    day:        str = Field(..., description="Day abbreviation: Mon, Tue, Wed, Thu, Fri, Sat, Sun")
-    meal_type:  str = Field(..., description="Meal type: Breakfast, Lunch, or Dinner")
-    menu_item:  str = Field(..., description="Exact menu item name e.g. 'Ugali Beef'")
-    week:       int = Field(2, ge=1, description="Week number — use 2+ for historical features")
+    school_id: str = Field(..., description="Student school ID e.g. s13/34556/25")
+    day:       str = Field(..., description="Day abbreviation: Mon, Tue, Wed, Thu, Fri, Sat, Sun")
+    meal_type: str = Field(..., description="Meal type: Breakfast, Lunch, or Dinner")
+    menu_item: str = Field(..., description="Exact menu item name e.g. 'Ugali Beef'")
+    week:      int = Field(2, ge=1, description="Week number — use 2+ for historical features")
 
     @field_validator('day')
     @classmethod
@@ -126,7 +177,7 @@ class SinglePredictionRequest(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
-                "student_id": 1,
+                "school_id": "s13/34556/25",
                 "day": "Mon",
                 "meal_type": "Lunch",
                 "menu_item": "Ugali Beef",
@@ -137,7 +188,8 @@ class SinglePredictionRequest(BaseModel):
 
 class PredictionResponse(BaseModel):
     """Result of a single item prediction."""
-    student_id:  int   = Field(..., description="Student ID")
+    school_id:   str   = Field(..., description="Student school ID")
+    student_id:  int   = Field(..., description="Internal student ID")
     day:         str   = Field(..., description="Day of week")
     meal_type:   str   = Field(..., description="Meal type")
     menu_item:   str   = Field(..., description="Menu item predicted")
@@ -254,6 +306,8 @@ def predict(
     req: SinglePredictionRequest,
     _key: str = Depends(require_api_key),
 ):
+    student_id = get_cached_student_id(req.school_id)
+
     model, encoders, feature_cols, threshold = get_model()
 
     try:
@@ -261,13 +315,12 @@ def predict(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    # Look up real feature context from database — caller does not supply these
-    ctx  = load_student_context(None, req.student_id, req.week)
+    ctx = get_cached_context(student_id, req.week)
     feat = get_feature_context(ctx, req.day, req.meal_type, req.menu_item)
 
     result = predict_single(
         model, encoders, feature_cols,
-        student_id=req.student_id, day=req.day,
+        student_id=student_id, day=req.day,
         meal_type=req.meal_type, menu_item=req.menu_item,
         week=req.week,
         hist_freq=feat['hist_freq'],
@@ -278,11 +331,12 @@ def predict(
     )
 
     prediction_logger.log_prediction(
-        student_id=req.student_id, week=req.week, day=req.day,
+        student_id=student_id, week=req.week, day=req.day,
         meal_type=req.meal_type, menu_item=req.menu_item,
         probability=result['probability'], choice=result['choice'],
         threshold=threshold, source='api-single',
     )
+    result['school_id'] = req.school_id
     return result
 
 
@@ -299,12 +353,14 @@ def predict(
 @limiter.limit("60/minute")
 def predict_menu(
     request: Request,
-    student_id: int = Query(..., gt=0, description="Student ID"),
+    school_id: str = Query(..., description="Student school ID e.g. s13/34556/25"),
     day:        str = Query(..., description="Day: Mon, Tue, Wed, Thu, Fri, Sat, Sun"),
     meal_type:  str = Query(..., description="Meal type: Breakfast, Lunch, or Dinner"),
     week:       int = Query(2,   ge=1, description="Week number (use 2+ for best results)"),
     _key: str = Depends(require_api_key),
 ):
+    student_id = get_cached_student_id(school_id)
+
     model, encoders, feature_cols, threshold = get_model()
 
     if day not in config.DAYS:
@@ -334,10 +390,12 @@ def predict_menu(
 @limiter.limit("20/minute")
 def predict_week(
     request: Request,
-    student_id: int = Query(..., gt=0, description="Student ID"),
+    school_id: str = Query(..., description="Student school ID e.g. s13/34556/25"),
     week:       int = Query(2,   ge=1, description="Week number (use 2+ for best results)"),
     _key: str = Depends(require_api_key),
 ):
+    student_id = get_cached_student_id(school_id)
+
     model, encoders, feature_cols, threshold = get_model()
 
     df = predict_weekly(

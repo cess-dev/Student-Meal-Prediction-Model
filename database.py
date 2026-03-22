@@ -41,17 +41,18 @@ def get_engine():
     url = os.getenv('DATABASE_URL')
     if not url:
         raise RuntimeError(
-            "DATABASE_URL environment variable is not set.\n"
-            "Add it to your .env file:\n"
-            "  DATABASE_URL=postgresql://user:password@host:5432/dbname"
+            "DATABASE_URL environment variable is not set."
         )
-    # Render / Supabase sometimes give postgres:// — SQLAlchemy needs postgresql://
     if url.startswith('postgres://'):
         url = url.replace('postgres://', 'postgresql://', 1)
+    
+    # Add sslmode if not already present
+    if 'sslmode' not in url:
+        url += '?sslmode=require'
 
     engine = create_engine(
         url,
-        pool_pre_ping=True,      # test connection before using from pool
+        pool_pre_ping=True,
         pool_size=5,
         max_overflow=10,
         echo=False,
@@ -112,21 +113,38 @@ class ModelMetadata(Base):
     threshold    = Column(Float,   nullable=False)
     feature_cols = Column(Text,    nullable=False)   # JSON string
     model_hash   = Column(String(64), nullable=True)
-    is_active    = Column(Boolean, default=True)     # only one active at a time
-
+    is_active    = Column(Boolean, default=True) 
+    
+class Student(Base):
+    __tablename__ = 'students'
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    school_id   = Column(String(50), unique=True, nullable=False, index=True)
+    name        = Column(String(100), nullable=True)
+    enrolled_at = Column(DateTime(timezone=True),
+                         default=lambda: datetime.now(timezone.utc))
 
 # ============================================================================
 # SESSION FACTORY
 # ============================================================================
 _SessionFactory = None
 
-def get_session() -> Session:
+from contextlib import contextmanager
+
+@contextmanager
+def get_session():
     global _SessionFactory
     if _SessionFactory is None:
         engine = get_engine()
         _SessionFactory = sessionmaker(bind=engine, expire_on_commit=False)
-    return _SessionFactory()
-
+    session = _SessionFactory()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 # ============================================================================
 # SETUP — create tables
@@ -136,6 +154,22 @@ def create_tables():
     Base.metadata.create_all(engine)
     logger.info("All tables created (or already exist)")
 
+def get_or_create_student(school_id: str) -> int:
+    """
+    Returns the internal integer ID for a school_id string.
+    Creates a new student record automatically if this is their first login.
+    Weeks 1-2 will use population averages (cold-start).
+    Week 3+ will use real order history for personalised predictions.
+    """
+    with get_session() as session:
+        student = session.query(Student).filter_by(school_id=school_id).first()
+        if not student:
+            student = Student(school_id=school_id)
+            session.add(student)
+            session.commit()
+            session.refresh(student)
+            logger.info(f"New student registered: {school_id} → internal id={student.id}")
+        return student.id
 
 # ============================================================================
 # MEAL ORDERS
